@@ -1,0 +1,3 @@
+sample_id	animal_id	batch	treatment	region	pmi	sex	genotype	fastq_r1	fastq_r2
+S001	A001	B1	SHAM	Ips	8h	Female	WT	/path/to/fastq/S001_R1.fastq.gz	/path/to/fastq/S001_R2.fastq.gz
+S002	A001	B1	SHAM	Con	8h	Female	WT	/path/to/fastq/S002_R1.fastq.gz	/path/to/fastq/S002_R2.fastq.gz

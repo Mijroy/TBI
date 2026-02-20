@@ -1,0 +1,55 @@
+"""
+TBI RNA-seq Upstream Pipeline
+QC → Trim → Align (STAR mm39) → Quantify (featureCounts)
+
+Usage (PBS cluster):
+    snakemake --profile workflow/profiles/pbs --jobs 50 --use-conda
+
+Usage (dry run):
+    snakemake -n --profile workflow/profiles/pbs
+
+Usage (local, 8 cores):
+    snakemake --use-conda --cores 8
+"""
+
+configfile: "config/config.yaml"
+
+import pandas as pd
+from pathlib import Path
+
+# ── Sample sheet ───────────────────────────────────────────────────────────────
+samples = (
+    pd.read_csv(config["samples"], sep="\t", comment="#")
+    .set_index("sample_id", drop=False)
+)
+SAMPLES = samples.index.tolist()
+
+
+def get_fastq(wildcards, read):
+    col = "fastq_r1" if read == "R1" else "fastq_r2"
+    return samples.loc[wildcards.sample, col]
+
+
+# ── Final targets ──────────────────────────────────────────────────────────────
+rule all:
+    input:
+        # Raw QC
+        expand("results/fastqc/raw/{sample}_{read}_fastqc.html",
+               sample=SAMPLES, read=["R1", "R2"]),
+        "results/multiqc/raw/multiqc_report.html",
+        # Post-trim QC
+        expand("results/fastqc/trimmed/{sample}_{read}_fastqc.html",
+               sample=SAMPLES, read=["R1", "R2"]),
+        "results/multiqc/trimmed/multiqc_report.html",
+        # Aligned + indexed BAMs
+        expand("results/aligned/{sample}/Aligned.sortedByCoord.out.bam.bai",
+               sample=SAMPLES),
+        "results/multiqc/aligned/multiqc_report.html",
+        # Count matrix
+        "results/counts/all_samples_counts.txt",
+
+
+include: "rules/fastqc.smk"
+include: "rules/trim.smk"
+include: "rules/align.smk"
+include: "rules/featurecounts.smk"

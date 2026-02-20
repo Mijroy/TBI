@@ -1,0 +1,9 @@
+name: tbi-align
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - star=2.7.11a
+  - samtools=1.19
+  - rseqc=5.0.3    # infer_experiment.py for strandedness check

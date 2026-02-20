@@ -1,0 +1,345 @@
+---
+title: "TBI RNA-seq — 03 DESeq2 Main Contrasts"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 6
+)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(DESeq2)
+  library(apeglm)
+  library(EnhancedVolcano)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(patchwork)
+  library(ggrepel)
+  library(ComplexHeatmap)
+})
+dir.create("results/analysis/03_deseq2_main", recursive = TRUE, showWarnings = FALSE)
+set.seed(42)
+
+FDR <- 0.05
+LFC <- 1.0   # |log2FoldChange| threshold for labelling
+```
+
+## Scientific questions
+
+| Contrast | Scientific question |
+|---|---|
+| TBI vs SHAM | What transcriptional programme is activated by traumatic brain injury? |
+| TBI.EGT vs TBI | Does EGT drug treatment suppress injury-induced gene expression? |
+| TBI.EGT vs SHAM | Does EGT restore the transcriptome toward the uninjured baseline? |
+| Ips vs Con | How does the injured hemisphere differ transcriptionally from the contralateral side? |
+| PMI 24h vs 8h | How does time of sacrifice affect gene expression? (biological signal vs degradation artefact) |
+| Male vs Female | Are there sex-biased transcriptional responses to TBI? |
+| KO vs WT | How does the KO genotype modify gene expression under these conditions? |
+
+---
+
+## Load data
+
+```{r load}
+counts <- readRDS("results/counts/count_matrix.rds")
+meta   <- readRDS("results/counts/metadata_filtered.rds")  # QC-filtered metadata
+counts <- counts[, meta$sample_id]   # align columns
+
+keep   <- rowSums(counts) >= 10
+counts <- counts[keep, ]
+cat(sprintf("%d genes × %d samples\n", nrow(counts), ncol(counts)))
+```
+
+---
+
+## Helper functions
+
+```{r helpers}
+# Run DESeq2 for a given design, return shrunken results for one contrast
+run_deseq2 <- function(counts, meta, design_formula, contrast_arg,
+                        coef_name = NULL, result_name = NULL) {
+  dds <- DESeqDataSetFromMatrix(
+    countData = counts,
+    colData   = meta,
+    design    = design_formula
+  )
+  dds <- DESeq(dds, test = "Wald", fitType = "parametric",
+               parallel = FALSE)
+
+  if (!is.null(coef_name)) {
+    # apeglm shrinkage (requires coef name)
+    res <- lfcShrink(dds, coef = coef_name, type = "apeglm")
+  } else {
+    res <- results(dds, contrast = contrast_arg, alpha = FDR)
+    res <- lfcShrink(dds, contrast = contrast_arg, type = "ashr")
+  }
+  as.data.frame(res) %>%
+    rownames_to_column("gene_id") %>%
+    arrange(padj, desc(abs(log2FoldChange)))
+}
+
+# Volcano plot wrapper
+volcano_plot <- function(res_df, title, fdr = FDR, lfc = LFC) {
+  EnhancedVolcano(res_df,
+    lab        = res_df$gene_id,
+    x          = "log2FoldChange",
+    y          = "padj",
+    pCutoff    = fdr,
+    FCcutoff   = lfc,
+    title      = title,
+    subtitle   = sprintf("FDR < %s | |LFC| > %s", fdr, lfc),
+    labSize    = 3,
+    pointSize  = 1.5,
+    legendPosition = "bottom")
+}
+
+# Summarise DEG counts
+count_degs <- function(res_df, label, fdr = FDR, lfc = LFC) {
+  sig <- res_df %>% filter(!is.na(padj) & padj < fdr & abs(log2FoldChange) >= lfc)
+  data.frame(
+    contrast = label,
+    total    = nrow(sig),
+    up       = sum(sig$log2FoldChange > 0),
+    down     = sum(sig$log2FoldChange < 0)
+  )
+}
+
+# Top-N heatmap of DEGs
+deg_heatmap <- function(res_df, vst_mat, meta, top_n = 50,
+                         fdr = FDR, lfc = LFC, title = "") {
+  sig <- res_df %>%
+    filter(!is.na(padj) & padj < fdr & abs(log2FoldChange) >= lfc) %>%
+    slice_min(padj, n = top_n)
+  if (nrow(sig) == 0) return(invisible(NULL))
+
+  mat  <- vst_mat[sig$gene_id, , drop = FALSE]
+  mat  <- t(scale(t(mat)))   # z-score per gene
+  ann  <- meta %>%
+    column_to_rownames("sample_id") %>%
+    select(treatment, region, sex, genotype, batch)
+
+  pheatmap(mat,
+           annotation_col = ann,
+           show_rownames  = nrow(mat) <= 60,
+           show_colnames  = FALSE,
+           color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+           breaks = seq(-3, 3, length.out = 101),
+           main = title,
+           fontsize_row = 7)
+}
+
+vst_mat <- readRDS("results/counts/vst_matrix.rds")
+```
+
+---
+
+## Model 1 — Treatment effect (all samples)
+
+**Design:** `~ batch + treatment`
+
+```{r treatment-model}
+dds_trt <- DESeqDataSetFromMatrix(counts, meta, ~ batch + treatment)
+dds_trt <- DESeq(dds_trt)
+resultsNames(dds_trt)
+```
+
+### TBI vs SHAM
+
+```{r tbi-vs-sham}
+res_tbi_sham <- lfcShrink(dds_trt,
+  contrast = c("treatment", "TBI", "SHAM"), type = "ashr") %>%
+  as.data.frame() %>% rownames_to_column("gene_id") %>%
+  arrange(padj, desc(abs(log2FoldChange)))
+
+write.csv(res_tbi_sham, "results/analysis/03_deseq2_main/TBI_vs_SHAM.csv",
+          row.names = FALSE)
+
+volcano_plot(res_tbi_sham, "TBI vs SHAM")
+ggsave("results/analysis/03_deseq2_main/volcano_TBI_vs_SHAM.pdf", width = 8, height = 7)
+deg_heatmap(res_tbi_sham, vst_mat, meta, title = "Top DEGs: TBI vs SHAM")
+```
+
+### EGT vs TBI (drug effect)
+
+```{r egt-vs-tbi}
+res_egt_tbi <- lfcShrink(dds_trt,
+  contrast = c("treatment", "TBI.EGT", "TBI"), type = "ashr") %>%
+  as.data.frame() %>% rownames_to_column("gene_id") %>%
+  arrange(padj, desc(abs(log2FoldChange)))
+
+write.csv(res_egt_tbi, "results/analysis/03_deseq2_main/EGT_vs_TBI.csv",
+          row.names = FALSE)
+
+volcano_plot(res_egt_tbi, "TBI.EGT vs TBI (drug effect)")
+ggsave("results/analysis/03_deseq2_main/volcano_EGT_vs_TBI.pdf", width = 8, height = 7)
+deg_heatmap(res_egt_tbi, vst_mat, meta, title = "Top DEGs: EGT vs TBI")
+```
+
+### EGT vs SHAM (injury recovery)
+
+```{r egt-vs-sham}
+res_egt_sham <- lfcShrink(dds_trt,
+  contrast = c("treatment", "TBI.EGT", "SHAM"), type = "ashr") %>%
+  as.data.frame() %>% rownames_to_column("gene_id") %>%
+  arrange(padj, desc(abs(log2FoldChange)))
+
+write.csv(res_egt_sham, "results/analysis/03_deseq2_main/EGT_vs_SHAM.csv",
+          row.names = FALSE)
+
+volcano_plot(res_egt_sham, "TBI.EGT vs SHAM (residual injury)")
+ggsave("results/analysis/03_deseq2_main/volcano_EGT_vs_SHAM.pdf", width = 8, height = 7)
+```
+
+---
+
+## Overlap: genes rescued by EGT
+
+```{r rescued}
+sig_tbi_sham <- res_tbi_sham %>% filter(!is.na(padj) & padj < FDR & abs(log2FoldChange) >= LFC)
+sig_egt_tbi  <- res_egt_tbi  %>% filter(!is.na(padj) & padj < FDR & abs(log2FoldChange) >= LFC)
+sig_egt_sham <- res_egt_sham %>% filter(!is.na(padj) & padj < FDR & abs(log2FoldChange) >= LFC)
+
+# Rescued = significant in TBI vs SHAM AND reversed in EGT vs TBI
+rescued_up <- intersect(
+  sig_tbi_sham$gene_id[sig_tbi_sham$log2FoldChange > 0],
+  sig_egt_tbi$gene_id [sig_egt_tbi$log2FoldChange  < 0]
+)
+rescued_dn <- intersect(
+  sig_tbi_sham$gene_id[sig_tbi_sham$log2FoldChange < 0],
+  sig_egt_tbi$gene_id [sig_egt_tbi$log2FoldChange  > 0]
+)
+
+cat(sprintf("EGT-rescued genes (TBI-upregulated, reversed by EGT): %d\n", length(rescued_up)))
+cat(sprintf("EGT-rescued genes (TBI-downregulated, restored by EGT): %d\n", length(rescued_dn)))
+
+rescued_df <- data.frame(
+  gene_id  = c(rescued_up, rescued_dn),
+  direction = c(rep("rescued_up", length(rescued_up)),
+                rep("rescued_down", length(rescued_dn)))
+)
+write.csv(rescued_df, "results/analysis/03_deseq2_main/EGT_rescued_genes.csv",
+          row.names = FALSE)
+```
+
+---
+
+## Model 2 — Brain region effect
+
+**Design:** `~ batch + region` (pooling all treatments for overall regional effect)
+
+```{r region-model}
+dds_reg <- DESeqDataSetFromMatrix(counts, meta, ~ batch + region)
+dds_reg <- DESeq(dds_reg)
+
+res_ips_con <- lfcShrink(dds_reg,
+  contrast = c("region", "Ips", "Con"), type = "ashr") %>%
+  as.data.frame() %>% rownames_to_column("gene_id") %>%
+  arrange(padj, desc(abs(log2FoldChange)))
+
+write.csv(res_ips_con, "results/analysis/03_deseq2_main/Ips_vs_Con.csv",
+          row.names = FALSE)
+
+volcano_plot(res_ips_con, "Ipsilateral vs Contralateral (all treatments)")
+ggsave("results/analysis/03_deseq2_main/volcano_Ips_vs_Con.pdf", width = 8, height = 7)
+```
+
+---
+
+## Model 3 — Postmortem interval
+
+**Design:** `~ batch + pmi`
+**Question:** Does 24h sacrifice vs 8h introduce transcript-stability artefacts?
+
+```{r pmi-model}
+dds_pmi <- DESeqDataSetFromMatrix(counts, meta, ~ batch + pmi)
+dds_pmi <- DESeq(dds_pmi)
+
+res_pmi <- lfcShrink(dds_pmi,
+  contrast = c("pmi", "24h", "8h"), type = "ashr") %>%
+  as.data.frame() %>% rownames_to_column("gene_id") %>%
+  arrange(padj, desc(abs(log2FoldChange)))
+
+write.csv(res_pmi, "results/analysis/03_deseq2_main/PMI_24h_vs_8h.csv",
+          row.names = FALSE)
+
+volcano_plot(res_pmi, "PMI 24h vs 8h")
+ggsave("results/analysis/03_deseq2_main/volcano_PMI.pdf", width = 8, height = 7)
+```
+
+---
+
+## Model 4 — Sex
+
+**Design:** `~ batch + sex`
+
+```{r sex-model}
+dds_sex <- DESeqDataSetFromMatrix(counts, meta, ~ batch + sex)
+dds_sex <- DESeq(dds_sex)
+
+res_sex <- lfcShrink(dds_sex,
+  contrast = c("sex", "Male", "Female"), type = "ashr") %>%
+  as.data.frame() %>% rownames_to_column("gene_id") %>%
+  arrange(padj, desc(abs(log2FoldChange)))
+
+write.csv(res_sex, "results/analysis/03_deseq2_main/Male_vs_Female.csv",
+          row.names = FALSE)
+
+volcano_plot(res_sex, "Male vs Female (all conditions)")
+ggsave("results/analysis/03_deseq2_main/volcano_sex.pdf", width = 8, height = 7)
+```
+
+---
+
+## Model 5 — Genotype
+
+**Design:** `~ batch + genotype`
+
+```{r geno-model}
+dds_geno <- DESeqDataSetFromMatrix(counts, meta, ~ batch + genotype)
+dds_geno <- DESeq(dds_geno)
+
+res_geno <- lfcShrink(dds_geno,
+  contrast = c("genotype", "KO", "WT"), type = "ashr") %>%
+  as.data.frame() %>% rownames_to_column("gene_id") %>%
+  arrange(padj, desc(abs(log2FoldChange)))
+
+write.csv(res_geno, "results/analysis/03_deseq2_main/KO_vs_WT.csv",
+          row.names = FALSE)
+
+volcano_plot(res_geno, "KO vs WT (all conditions)")
+ggsave("results/analysis/03_deseq2_main/volcano_genotype.pdf", width = 8, height = 7)
+```
+
+---
+
+## DEG summary table
+
+```{r deg-summary}
+deg_summary <- bind_rows(
+  count_degs(res_tbi_sham,  "TBI vs SHAM"),
+  count_degs(res_egt_tbi,   "EGT vs TBI"),
+  count_degs(res_egt_sham,  "EGT vs SHAM"),
+  count_degs(res_ips_con,   "Ips vs Con"),
+  count_degs(res_pmi,       "PMI 24h vs 8h"),
+  count_degs(res_sex,       "Male vs Female"),
+  count_degs(res_geno,      "KO vs WT")
+)
+
+knitr::kable(deg_summary, caption = sprintf("DEGs at FDR < %s, |LFC| ≥ %s", FDR, LFC))
+write.csv(deg_summary, "results/analysis/03_deseq2_main/deg_summary.csv", row.names = FALSE)
+```
+
+---
+
+## Session info
+```{r session}
+sessionInfo()
+```

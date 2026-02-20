@@ -1,0 +1,293 @@
+---
+title: "TBI RNA-seq — 04 DESeq2 Interaction Models"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 6
+)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(DESeq2)
+  library(ggrepel)
+  library(pheatmap)
+  library(patchwork)
+  library(RColorBrewer)
+  library(EnhancedVolcano)
+})
+dir.create("results/analysis/04_deseq2_interactions", recursive = TRUE,
+           showWarnings = FALSE)
+set.seed(42)
+FDR <- 0.05
+LFC <- 1.0
+```
+
+## Scientific questions
+
+| Model | Scientific question |
+|---|---|
+| Treatment × Sex | Do males and females mount different transcriptional responses to TBI and EGT? |
+| Treatment × Genotype | Does the KO gene modify how the brain responds to injury or drug treatment? |
+| Treatment × Region | Is the drug effect or injury response regionally asymmetric (Ips ≠ Con)? |
+| Treatment × PMI | Does time of sacrifice confound the apparent treatment effect? |
+
+---
+
+## Load data
+
+```{r load}
+counts <- readRDS("results/counts/count_matrix.rds")
+meta   <- readRDS("results/counts/metadata_filtered.rds")
+counts <- counts[, meta$sample_id]
+counts <- counts[rowSums(counts) >= 10, ]
+vst_mat <- readRDS("results/counts/vst_matrix.rds")
+cat(sprintf("%d genes × %d samples\n", nrow(counts), ncol(counts)))
+```
+
+---
+
+## Helper: extract interaction terms
+
+```{r helpers}
+# Extract genes where the interaction term is significant
+# i.e. the effect of treatment DIFFERS between levels of the moderator
+extract_interaction <- function(dds, coef_pattern, result_name) {
+  coefs <- resultsNames(dds)
+  interaction_coefs <- grep(coef_pattern, coefs, value = TRUE)
+  if (length(interaction_coefs) == 0) {
+    warning("No coefficients matching: ", coef_pattern)
+    return(NULL)
+  }
+  lapply(interaction_coefs, function(coef) {
+    res <- lfcShrink(dds, coef = coef, type = "apeglm")
+    as.data.frame(res) %>%
+      rownames_to_column("gene_id") %>%
+      mutate(coef = coef) %>%
+      arrange(padj, desc(abs(log2FoldChange)))
+  }) %>% bind_rows()
+}
+```
+
+---
+
+## Interaction 1: Treatment × Sex
+
+**Design:** `~ batch + treatment + sex + treatment:sex`
+
+Genes with significant `treatment:sex` interaction terms are those for which
+the treatment effect differs between males and females.
+
+```{r trt-sex}
+dds_ts <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = meta,
+  design    = ~ batch + treatment + sex + treatment:sex
+)
+dds_ts$treatment <- relevel(dds_ts$treatment, ref = "SHAM")
+dds_ts$sex       <- relevel(dds_ts$sex,       ref = "Female")
+dds_ts <- DESeq(dds_ts)
+resultsNames(dds_ts)
+
+res_ts <- extract_interaction(dds_ts, "treatment.*\\.sex|sex.*\\.treatment",
+                               "Treatment_x_Sex")
+if (!is.null(res_ts)) {
+  write.csv(res_ts,
+            "results/analysis/04_deseq2_interactions/Treatment_x_Sex.csv",
+            row.names = FALSE)
+
+  # How many genes show sex-specific TBI response?
+  sig_ts <- res_ts %>% filter(!is.na(padj) & padj < FDR & abs(log2FoldChange) >= LFC)
+  cat(sprintf("Genes with significant Treatment × Sex interaction: %d\n", nrow(sig_ts)))
+}
+```
+
+### Sex-stratified volcano: TBI vs SHAM within each sex
+
+```{r sex-stratified}
+plot_sex_strat <- function(sex_level) {
+  sub_counts <- counts[, meta$sex == sex_level]
+  sub_meta   <- meta[meta$sex == sex_level, ]
+
+  dds_s <- DESeqDataSetFromMatrix(sub_counts, sub_meta, ~ batch + treatment)
+  dds_s <- DESeq(dds_s)
+
+  res <- lfcShrink(dds_s, contrast = c("treatment", "TBI", "SHAM"),
+                   type = "ashr") %>%
+    as.data.frame() %>% rownames_to_column("gene_id")
+  write.csv(res,
+    sprintf("results/analysis/04_deseq2_interactions/TBI_vs_SHAM_%s.csv", sex_level),
+    row.names = FALSE)
+  res
+}
+
+res_tbi_female <- plot_sex_strat("Female")
+res_tbi_male   <- plot_sex_strat("Male")
+
+# Scatter: male vs female LFC for TBI vs SHAM genes
+lfc_compare <- inner_join(
+  res_tbi_female %>% select(gene_id, lfc_female = log2FoldChange, padj_female = padj),
+  res_tbi_male   %>% select(gene_id, lfc_male   = log2FoldChange, padj_male   = padj),
+  by = "gene_id"
+) %>%
+  mutate(sex_specific = case_when(
+    padj_female < FDR & padj_male >= FDR  ~ "Female-specific",
+    padj_female >= FDR & padj_male < FDR  ~ "Male-specific",
+    padj_female < FDR & padj_male < FDR   ~ "Shared",
+    TRUE                                  ~ "NS"
+  ))
+
+ggplot(lfc_compare, aes(lfc_female, lfc_male, colour = sex_specific)) +
+  geom_point(size = 1, alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0) + geom_hline(yintercept = 0) +
+  scale_colour_manual(values = c("Female-specific" = "#e41a1c",
+                                 "Male-specific"   = "#377eb8",
+                                 "Shared"          = "#4daf4a",
+                                 "NS"              = "grey80")) +
+  labs(x = "log2FC (Female: TBI vs SHAM)",
+       y = "log2FC (Male: TBI vs SHAM)",
+       title = "Sex-stratified TBI response",
+       colour = NULL) +
+  theme_bw()
+ggsave("results/analysis/04_deseq2_interactions/sex_LFC_scatter.pdf",
+       width = 7, height = 6)
+```
+
+---
+
+## Interaction 2: Treatment × Genotype
+
+**Design:** `~ batch + treatment + genotype + treatment:genotype`
+
+Tests whether the KO gene modifies the transcriptional response to TBI or EGT.
+
+```{r trt-geno}
+dds_tg <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = meta,
+  design    = ~ batch + treatment + genotype + treatment:genotype
+)
+dds_tg$treatment <- relevel(dds_tg$treatment, ref = "SHAM")
+dds_tg$genotype  <- relevel(dds_tg$genotype,  ref = "WT")
+dds_tg <- DESeq(dds_tg)
+resultsNames(dds_tg)
+
+res_tg <- extract_interaction(dds_tg, "treatment.*\\.genotype|genotype.*\\.treatment",
+                               "Treatment_x_Genotype")
+if (!is.null(res_tg)) {
+  write.csv(res_tg,
+            "results/analysis/04_deseq2_interactions/Treatment_x_Genotype.csv",
+            row.names = FALSE)
+  sig_tg <- res_tg %>% filter(!is.na(padj) & padj < FDR & abs(log2FoldChange) >= LFC)
+  cat(sprintf("Genes with significant Treatment × Genotype interaction: %d\n",
+              nrow(sig_tg)))
+}
+```
+
+### Genotype-stratified: TBI vs SHAM within WT and KO
+
+```{r geno-stratified}
+plot_geno_strat <- function(geno_level) {
+  sub_counts <- counts[, meta$genotype == geno_level]
+  sub_meta   <- meta[meta$genotype == geno_level, ]
+  dds_g <- DESeqDataSetFromMatrix(sub_counts, sub_meta, ~ batch + treatment)
+  dds_g <- DESeq(dds_g)
+  res <- lfcShrink(dds_g, contrast = c("treatment", "TBI", "SHAM"),
+                   type = "ashr") %>%
+    as.data.frame() %>% rownames_to_column("gene_id")
+  write.csv(res,
+    sprintf("results/analysis/04_deseq2_interactions/TBI_vs_SHAM_%s.csv", geno_level),
+    row.names = FALSE)
+  res
+}
+
+res_tbi_wt <- plot_geno_strat("WT")
+res_tbi_ko <- plot_geno_strat("KO")
+
+# Genes that are specifically dysregulated in KO after TBI
+ko_specific_up <- setdiff(
+  res_tbi_ko$gene_id[!is.na(res_tbi_ko$padj) &
+                     res_tbi_ko$padj < FDR &
+                     res_tbi_ko$log2FoldChange > LFC],
+  res_tbi_wt$gene_id[!is.na(res_tbi_wt$padj) &
+                     res_tbi_wt$padj < FDR]
+)
+cat(sprintf("KO-specific TBI-upregulated genes: %d\n", length(ko_specific_up)))
+```
+
+---
+
+## Interaction 3: Treatment × Region
+
+**Design:** `~ batch + treatment + region + treatment:region`
+
+Tests whether the ipsilateral vs contralateral difference is treatment-dependent.
+
+```{r trt-region}
+dds_tr <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = meta,
+  design    = ~ batch + treatment + region + treatment:region
+)
+dds_tr$treatment <- relevel(dds_tr$treatment, ref = "SHAM")
+dds_tr$region    <- relevel(dds_tr$region,    ref = "Con")
+dds_tr <- DESeq(dds_tr)
+resultsNames(dds_tr)
+
+res_tr <- extract_interaction(dds_tr, "treatment.*\\.region|region.*\\.treatment",
+                               "Treatment_x_Region")
+if (!is.null(res_tr)) {
+  write.csv(res_tr,
+            "results/analysis/04_deseq2_interactions/Treatment_x_Region.csv",
+            row.names = FALSE)
+  sig_tr <- res_tr %>% filter(!is.na(padj) & padj < FDR & abs(log2FoldChange) >= LFC)
+  cat(sprintf("Genes with significant Treatment × Region interaction: %d\n",
+              nrow(sig_tr)))
+}
+```
+
+---
+
+## Interaction 4: Treatment × PMI
+
+**Design:** `~ batch + treatment + pmi + treatment:pmi`
+
+Tests whether the apparent treatment effect is confounded by time of sacrifice.
+
+```{r trt-pmi}
+dds_tp <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = meta,
+  design    = ~ batch + treatment + pmi + treatment:pmi
+)
+dds_tp$treatment <- relevel(dds_tp$treatment, ref = "SHAM")
+dds_tp$pmi       <- relevel(dds_tp$pmi,       ref = "8h")
+dds_tp <- DESeq(dds_tp)
+resultsNames(dds_tp)
+
+res_tp <- extract_interaction(dds_tp, "treatment.*\\.pmi|pmi.*\\.treatment",
+                               "Treatment_x_PMI")
+if (!is.null(res_tp)) {
+  write.csv(res_tp,
+            "results/analysis/04_deseq2_interactions/Treatment_x_PMI.csv",
+            row.names = FALSE)
+  sig_tp <- res_tp %>% filter(!is.na(padj) & padj < FDR & abs(log2FoldChange) >= LFC)
+  cat(sprintf("Genes with significant Treatment × PMI interaction: %d\n",
+              nrow(sig_tp)))
+}
+```
+
+---
+
+## Session info
+```{r session}
+sessionInfo()
+```

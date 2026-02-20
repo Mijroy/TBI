@@ -1,0 +1,351 @@
+---
+title: "TBI RNA-seq — 06 Co-expression Network (WGCNA)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 10, fig.height = 7
+)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(WGCNA)
+  library(DESeq2)
+  library(clusterProfiler)
+  library(org.Mm.eg.db)
+  library(AnnotationDbi)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(igraph)
+})
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+dir.create("results/analysis/06_network", recursive = TRUE, showWarnings = FALSE)
+set.seed(42)
+```
+
+## Scientific questions
+
+1. What co-expression modules are robustly associated with TBI severity or treatment?
+2. Which hub genes are most central in TBI-associated modules, making them candidate targets or biomarkers?
+3. Do co-expression modules reflect distinct cell types (neurons, astrocytes, microglia, endothelial)?
+4. How does the KO genotype affect module structure?
+5. Are PMI-associated modules distinct from injury-associated modules (separating biology from artefact)?
+
+---
+
+## Prepare input expression matrix
+
+```{r load}
+counts  <- readRDS("results/counts/count_matrix.rds")
+meta    <- readRDS("results/counts/metadata_filtered.rds")
+counts  <- counts[, meta$sample_id]
+
+# Use variance-stabilised, batch-corrected matrix for WGCNA
+vst_corr <- readRDS("results/counts/vst_corrected_matrix.rds")
+
+# WGCNA requires samples as rows, genes as columns
+expr_mat <- t(vst_corr)
+
+cat(sprintf("Input: %d samples × %d genes\n", nrow(expr_mat), ncol(expr_mat)))
+```
+
+---
+
+## Filter low-variance genes
+
+```{r filter-var}
+# Keep top 5000 most variable genes to reduce computation
+gene_var <- apply(expr_mat, 2, var)
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:5000]
+expr_mat  <- expr_mat[, top_genes]
+
+cat(sprintf("After variance filtering: %d genes\n", ncol(expr_mat)))
+```
+
+---
+
+## Sample network: detect outliers
+
+```{r sample-outlier}
+sft_tree <- hclust(dist(expr_mat), method = "average")
+plot(sft_tree, labels = rownames(expr_mat),
+     cex = 0.6, main = "Sample clustering (pre-WGCNA outlier detection)")
+```
+
+---
+
+## Soft-thresholding power selection
+
+```{r soft-threshold}
+powers <- c(1:10, seq(12, 20, by = 2))
+sft    <- pickSoftThreshold(expr_mat,
+                             powerVector = powers,
+                             networkType = "signed",
+                             verbose     = 0)
+
+# Plot scale-free topology fit
+par(mfrow = c(1, 2))
+plot(sft$fitIndices$Power,
+     -sign(sft$fitIndices$slope) * sft$fitIndices$SFT.R.sq,
+     xlab = "Soft threshold (power)", ylab = "Scale free topology R²",
+     type = "b", main = "Scale-free topology fit")
+abline(h = 0.85, col = "red", lty = 2)
+
+plot(sft$fitIndices$Power, sft$fitIndices$mean.k.,
+     xlab = "Soft threshold (power)", ylab = "Mean connectivity",
+     type = "b", main = "Mean connectivity")
+
+# Select power: smallest power with R² ≥ 0.85
+soft_power <- sft$fitIndices$Power[
+  which(-sign(sft$fitIndices$slope) * sft$fitIndices$SFT.R.sq >= 0.85)[1]
+]
+if (is.na(soft_power)) soft_power <- 12   # fallback
+cat(sprintf("Selected soft-thresholding power: %d\n", soft_power))
+```
+
+---
+
+## Network construction and module detection
+
+```{r wgcna-build, cache=TRUE}
+net <- blockwiseModules(
+  expr_mat,
+  power            = soft_power,
+  networkType      = "signed",
+  TOMType          = "signed",
+  minModuleSize    = 30,
+  mergeCutHeight   = 0.25,
+  maxBlockSize     = 5000,
+  numericLabels    = FALSE,
+  saveTOMs         = FALSE,
+  verbose          = 0
+)
+
+module_colours <- net$colors
+cat(sprintf("Detected %d modules (excluding grey)\n",
+            length(unique(module_colours[module_colours != "grey"]))))
+table(module_colours) %>% sort(decreasing = TRUE)
+```
+
+---
+
+## Module dendrogram
+
+```{r module-dendro}
+plotDendroAndColors(
+  net$dendrograms[[1]],
+  module_colours[net$blockGenes[[1]]],
+  "Module colours",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05,
+  main = "Gene dendrogram and module colours"
+)
+```
+
+---
+
+## Module eigengenes
+
+```{r eigengenes}
+MEs <- moduleEigengenes(expr_mat, module_colours)$eigengenes
+MEs_ordered <- orderMEs(MEs)
+```
+
+---
+
+## Module–trait correlation
+
+```{r trait-corr}
+# Build numeric trait matrix
+trait_mat <- meta %>%
+  select(treatment, region, sex, genotype, pmi, batch) %>%
+  mutate(
+    TBI        = as.integer(treatment == "TBI"),
+    TBI_EGT    = as.integer(treatment == "TBI.EGT"),
+    Ipsilateral = as.integer(region == "Ips"),
+    Male       = as.integer(sex == "Male"),
+    KO         = as.integer(genotype == "KO"),
+    PMI_24h    = as.integer(pmi == "24h"),
+    Batch2     = as.integer(batch == "B2")
+  ) %>%
+  select(TBI, TBI_EGT, Ipsilateral, Male, KO, PMI_24h, Batch2) %>%
+  as.data.frame()
+rownames(trait_mat) <- meta$sample_id
+
+n_samples <- nrow(expr_mat)
+module_trait_cor  <- cor(MEs_ordered, trait_mat, use = "pairwise.complete.obs")
+module_trait_pval <- corPvalueFisher(module_trait_cor, n_samples)
+
+# Heatmap
+text_mat <- paste0(
+  round(module_trait_cor, 2), "\n(",
+  signif(module_trait_pval, 1), ")"
+)
+dim(text_mat) <- dim(module_trait_cor)
+
+labeledHeatmap(
+  Matrix     = module_trait_cor,
+  xLabels    = colnames(trait_mat),
+  yLabels    = names(MEs_ordered),
+  ySymbols   = names(MEs_ordered),
+  colorLabels = FALSE,
+  colors     = blueWhiteRed(50),
+  textMatrix = text_mat,
+  setStdMargins = FALSE,
+  cex.text   = 0.7,
+  zlim       = c(-1, 1),
+  main       = "Module–trait correlations (Pearson r, p-value)"
+)
+
+# Save
+corr_df <- as.data.frame(module_trait_cor) %>%
+  rownames_to_column("module")
+write.csv(corr_df,
+          "results/analysis/06_network/module_trait_correlations.csv",
+          row.names = FALSE)
+```
+
+---
+
+## Hub genes per module
+
+```{r hub-genes}
+# Module membership (kME): correlation of each gene with its module eigengene
+kME <- cor(expr_mat, MEs_ordered, use = "pairwise.complete.obs")
+
+# Top hub genes per module (highest |kME|)
+hub_genes <- lapply(unique(module_colours[module_colours != "grey"]), function(mod) {
+  mod_genes   <- names(module_colours)[module_colours == mod]
+  me_col      <- paste0("ME", mod)
+  if (!me_col %in% colnames(kME)) return(NULL)
+  kme_vals    <- kME[mod_genes, me_col]
+  top_hubs    <- names(sort(abs(kme_vals), decreasing = TRUE))[1:min(20, length(kme_vals))]
+  data.frame(module = mod, gene_id = top_hubs,
+             kME = kme_vals[top_hubs])
+}) %>%
+  bind_rows() %>%
+  arrange(module, desc(abs(kME)))
+
+# Map to gene symbols
+hub_genes <- hub_genes %>%
+  mutate(ENSEMBL = sub("\\.\\d+$", "", gene_id)) %>%
+  left_join(
+    AnnotationDbi::select(org.Mm.eg.db,
+      keys    = unique(sub("\\.\\d+$", "", hub_genes$gene_id)),
+      columns = c("SYMBOL", "GENENAME"),
+      keytype = "ENSEMBL"),
+    by = "ENSEMBL"
+  )
+
+write.csv(hub_genes, "results/analysis/06_network/hub_genes_per_module.csv",
+          row.names = FALSE)
+cat("Top 5 hub genes per module:\n")
+hub_genes %>% group_by(module) %>% slice_head(n = 5) %>%
+  select(module, SYMBOL, kME) %>% print(n = Inf)
+```
+
+---
+
+## GO enrichment of TBI-associated modules
+
+```{r module-go}
+# Identify modules strongly correlated with TBI trait (|r| > 0.3, p < 0.05)
+tbi_modules <- rownames(module_trait_cor)[
+  abs(module_trait_cor[, "TBI"]) > 0.3 &
+  module_trait_pval[, "TBI"] < 0.05
+]
+cat("TBI-associated modules:", paste(tbi_modules, collapse = ", "), "\n")
+
+for (mod in gsub("ME", "", tbi_modules)) {
+  mod_genes   <- sub("\\.\\d+$", "", names(module_colours)[module_colours == mod])
+  universe    <- sub("\\.\\d+$", "", colnames(expr_mat))
+
+  entrez_mod  <- AnnotationDbi::select(org.Mm.eg.db,
+    keys = mod_genes, columns = "ENTREZID", keytype = "ENSEMBL") %>%
+    filter(!is.na(ENTREZID)) %>% pull(ENTREZID)
+  entrez_univ <- AnnotationDbi::select(org.Mm.eg.db,
+    keys = universe, columns = "ENTREZID", keytype = "ENSEMBL") %>%
+    filter(!is.na(ENTREZID)) %>% pull(ENTREZID)
+
+  if (length(entrez_mod) < 10) next
+
+  ego <- enrichGO(gene         = entrez_mod,
+                  universe     = entrez_univ,
+                  OrgDb        = org.Mm.eg.db,
+                  ont          = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff = 0.05,
+                  readable     = TRUE)
+  if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+    p <- dotplot(ego, showCategory = 15) +
+      ggtitle(sprintf("Module %s — GO:BP enrichment", mod))
+    ggsave(sprintf("results/analysis/06_network/GO_module_%s.pdf", mod),
+           p, width = 8, height = 6)
+    write.csv(as.data.frame(ego),
+      sprintf("results/analysis/06_network/GO_module_%s.csv", mod),
+      row.names = FALSE)
+  }
+}
+```
+
+---
+
+## Export for Cytoscape
+
+```{r cytoscape-export}
+# Export the top hub-gene network for the strongest TBI module
+if (length(tbi_modules) > 0) {
+  top_mod    <- gsub("ME", "", tbi_modules[1])
+  mod_genes  <- names(module_colours)[module_colours == top_mod]
+
+  # Keep top 50 hubs by kME
+  top50 <- hub_genes %>%
+    filter(module == top_mod) %>%
+    slice_head(n = 50) %>%
+    pull(gene_id)
+
+  # Sub-TOM for these genes
+  sub_expr <- expr_mat[, intersect(top50, colnames(expr_mat))]
+  sub_tom  <- TOMsimilarity(adjacency(sub_expr, power = soft_power,
+                                      type = "signed"),
+                             TOMType = "signed")
+  rownames(sub_tom) <- colnames(sub_tom) <- colnames(sub_expr)
+
+  # Build edge list (weight > 0.05)
+  edge_df <- as.data.frame(as.table(sub_tom)) %>%
+    setNames(c("from", "to", "weight")) %>%
+    filter(from < to & weight > 0.05) %>%
+    arrange(desc(weight))
+
+  write.csv(edge_df,
+    sprintf("results/analysis/06_network/cytoscape_edges_module_%s.csv", top_mod),
+    row.names = FALSE)
+
+  node_df <- hub_genes %>%
+    filter(module == top_mod, gene_id %in% top50) %>%
+    select(gene_id, SYMBOL, kME)
+  write.csv(node_df,
+    sprintf("results/analysis/06_network/cytoscape_nodes_module_%s.csv", top_mod),
+    row.names = FALSE)
+
+  cat(sprintf("Exported %d edges and %d nodes for module %s → Cytoscape\n",
+              nrow(edge_df), nrow(node_df), top_mod))
+}
+```
+
+---
+
+## Session info
+```{r session}
+sessionInfo()
+```

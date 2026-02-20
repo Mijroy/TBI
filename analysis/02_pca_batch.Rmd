@@ -1,0 +1,205 @@
+---
+title: "TBI RNA-seq — 02 PCA & Batch Correction"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 6
+)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(DESeq2)
+  library(limma)
+  library(variancePartition)
+  library(ggrepel)
+  library(patchwork)
+  library(RColorBrewer)
+  library(pheatmap)
+})
+dir.create("results/analysis/02_pca_batch", recursive = TRUE, showWarnings = FALSE)
+set.seed(42)
+```
+
+## Scientific questions
+
+1. What is the dominant source of transcriptome-wide variance — batch, treatment, sex, genotype, or brain region?
+2. Does sequencing batch drive a major principal component, requiring correction in the DESeq2 model?
+3. After VST normalisation, do biological groups (treatment, region) separate on PCA?
+4. Is postmortem interval (PMI) confounded with any biological variable?
+5. Do ipsilateral/contralateral pairs from the same animal cluster together, confirming paired structure?
+
+---
+
+## Load and filter data
+
+```{r load}
+counts     <- readRDS("results/counts/count_matrix.rds")
+meta       <- readRDS("results/counts/metadata.rds")
+exclude_ids <- readRDS("results/analysis/01_sample_qc/exclude_samples.rds")
+
+if (length(exclude_ids) > 0) {
+  cat("Excluding", length(exclude_ids), "QC-flagged samples\n")
+  keep_idx <- !colnames(counts) %in% exclude_ids
+  counts   <- counts[, keep_idx]
+  meta     <- meta[keep_idx, ]
+}
+
+# Minimum-count filter: keep genes with ≥10 summed counts
+keep_genes <- rowSums(counts) >= 10
+counts     <- counts[keep_genes, ]
+cat(sprintf("Retained %d genes × %d samples after filtering\n",
+            nrow(counts), ncol(counts)))
+```
+
+---
+
+## VST normalisation
+
+```{r vst}
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = meta,
+  design    = ~ batch + treatment   # minimal design for normalisation
+)
+vst <- vst(dds, blind = TRUE)
+vst_mat <- assay(vst)
+```
+
+---
+
+## PCA — raw (batch not corrected)
+
+```{r pca-raw}
+pca_res <- prcomp(t(vst_mat), center = TRUE, scale. = FALSE)
+pve     <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+
+pca_df <- as.data.frame(pca_res$x[, 1:5]) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(meta, by = "sample_id")
+
+plot_pca <- function(df, x, y, colour_var, shape_var = NULL, title = NULL) {
+  p <- ggplot(df, aes(.data[[x]], .data[[y]],
+                      colour = .data[[colour_var]],
+                      shape  = if (!is.null(shape_var)) .data[[shape_var]] else NULL)) +
+    geom_point(size = 3, alpha = 0.8) +
+    geom_text_repel(aes(label = sample_id), size = 2, max.overlaps = 15) +
+    labs(x = sprintf("%s (%s%%)", x, pve[as.integer(sub("PC", "", x))]),
+         y = sprintf("%s (%s%%)", y, pve[as.integer(sub("PC", "", y))]),
+         title = title) +
+    theme_bw()
+  p
+}
+
+p1 <- plot_pca(pca_df, "PC1", "PC2", "batch",     title = "Batch")
+p2 <- plot_pca(pca_df, "PC1", "PC2", "treatment", title = "Treatment")
+p3 <- plot_pca(pca_df, "PC1", "PC2", "region",    title = "Brain region")
+p4 <- plot_pca(pca_df, "PC1", "PC2", "sex",       title = "Sex")
+p5 <- plot_pca(pca_df, "PC1", "PC2", "genotype",  title = "Genotype")
+p6 <- plot_pca(pca_df, "PC1", "PC2", "pmi",       title = "PMI")
+
+(p1 | p2) / (p3 | p4) / (p5 | p6)
+ggsave("results/analysis/02_pca_batch/pca_raw_grid.pdf", width = 14, height = 18)
+```
+
+---
+
+## Variance partitioning
+
+```{r varpart}
+# Quantify % variance explained by each experimental factor
+form <- ~ (1 | batch) + (1 | treatment) + (1 | region) +
+           (1 | sex)  + (1 | genotype)  + (1 | pmi)
+vp <- fitExtractVarPartModel(vst_mat, form, meta)
+plotVarPart(sortCols(vp),
+            main = "Variance explained by each experimental factor") +
+  theme_bw()
+ggsave("results/analysis/02_pca_batch/variance_partition.pdf", width = 8, height = 5)
+```
+
+---
+
+## Batch correction (limma::removeBatchEffect)
+
+This corrected matrix is **for visualisation only**.
+DESeq2 models (steps 03–04) include `batch` in the design formula instead.
+
+```{r batch-correct}
+vst_corrected <- removeBatchEffect(
+  vst_mat,
+  batch       = meta$batch,
+  design      = model.matrix(~ treatment + region + sex + genotype + pmi, data = meta)
+)
+
+pca_corr <- prcomp(t(vst_corrected), center = TRUE, scale. = FALSE)
+pve_corr <- round(100 * pca_corr$sdev^2 / sum(pca_corr$sdev^2), 1)
+
+pca_corr_df <- as.data.frame(pca_corr$x[, 1:5]) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(meta, by = "sample_id")
+
+q1 <- plot_pca(pca_corr_df, "PC1", "PC2", "batch",     title = "Batch (corrected)")
+q2 <- plot_pca(pca_corr_df, "PC1", "PC2", "treatment", title = "Treatment (corrected)")
+q3 <- plot_pca(pca_corr_df, "PC1", "PC2", "region",    title = "Region (corrected)")
+q4 <- plot_pca(pca_corr_df, "PC1", "PC2", "sex",       title = "Sex (corrected)")
+
+(q1 | q2) / (q3 | q4)
+ggsave("results/analysis/02_pca_batch/pca_corrected_grid.pdf", width = 12, height = 10)
+```
+
+---
+
+## PC1–PC5 scree and metadata associations
+
+```{r pc-assoc}
+pcs <- pca_corr_df %>% select(PC1:PC5, treatment, region, pmi, sex, genotype, batch)
+
+assoc_results <- lapply(c("treatment", "region", "pmi", "sex", "genotype", "batch"),
+  function(var) {
+    lapply(paste0("PC", 1:5), function(pc) {
+      f <- aov(as.formula(paste(pc, "~", var)), data = pcs)
+      data.frame(PC = pc, variable = var,
+                 p_value = summary(f)[[1]][["Pr(>F)"]][1])
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+
+assoc_wide <- assoc_results %>%
+  mutate(neg_log10_p = -log10(p_value)) %>%
+  pivot_wider(id_cols = variable, names_from = PC, values_from = neg_log10_p)
+
+pheatmap(
+  as.matrix(assoc_wide[, -1]),
+  labels_row  = assoc_wide$variable,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  color = colorRampPalette(c("white", "#d73027"))(50),
+  main = "PC–metadata association (-log10 ANOVA p)",
+  filename = "results/analysis/02_pca_batch/pc_metadata_assoc.pdf",
+  width = 6, height = 4
+)
+```
+
+---
+
+## Save corrected matrix for downstream use
+
+```{r save}
+saveRDS(vst_mat,       "results/counts/vst_matrix.rds")
+saveRDS(vst_corrected, "results/counts/vst_corrected_matrix.rds")
+saveRDS(meta,          "results/counts/metadata_filtered.rds")
+cat("VST and batch-corrected matrices saved.\n")
+```
+
+---
+
+## Session info
+```{r session}
+sessionInfo()
+```

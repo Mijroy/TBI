@@ -1,0 +1,213 @@
+---
+title: "TBI RNA-seq — 01 Sample QC"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 5,
+  out.dir = "results/analysis/01_sample_qc/"
+)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(patchwork)
+  library(here)
+})
+dir.create("results/analysis/01_sample_qc", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Scientific questions
+
+1. Which samples have adequate sequencing depth (>10 M mapped reads)?
+2. Are alignment rates consistently high (>80%) across batches and treatment groups?
+3. Are duplication rates elevated in any sample subset (library quality concern)?
+4. Do any samples cluster as outliers in the raw-count space?
+5. Is there a batch-related difference in technical quality metrics?
+
+---
+
+## Load data
+
+```{r load}
+counts <- readRDS("results/counts/count_matrix.rds")
+meta   <- readRDS("results/counts/metadata.rds")
+
+stopifnot(identical(colnames(counts), meta$sample_id))
+cat(sprintf("Loaded %d genes × %d samples\n", nrow(counts), ncol(counts)))
+```
+
+---
+
+## Sequencing depth
+
+```{r depth}
+meta$total_counts <- colSums(counts)
+depth_cutoff <- 10e6
+
+p_depth <- ggplot(meta, aes(x = reorder(sample_id, total_counts),
+                             y = total_counts / 1e6,
+                             fill = batch)) +
+  geom_col() +
+  geom_hline(yintercept = depth_cutoff / 1e6, linetype = "dashed", colour = "red") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set1") +
+  labs(x = NULL, y = "Total counts (millions)",
+       title = "Sequencing depth per sample",
+       caption = "Red dashed line = 10 M read threshold") +
+  theme_bw(base_size = 9)
+
+ggsave("results/analysis/01_sample_qc/depth_barplot.pdf", p_depth,
+       width = 8, height = max(4, nrow(meta) * 0.12))
+p_depth
+```
+
+```{r depth-flag}
+low_depth <- meta %>% filter(total_counts < depth_cutoff)
+if (nrow(low_depth) > 0) {
+  cat("Samples below depth threshold:\n")
+  print(low_depth[, c("sample_id", "batch", "treatment", "total_counts")])
+} else {
+  cat("All samples pass the depth threshold.\n")
+}
+```
+
+---
+
+## Genes detected
+
+```{r detection}
+meta$genes_detected <- colSums(counts > 0)
+
+ggplot(meta, aes(x = treatment, y = genes_detected, fill = batch)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 1, alpha = 0.6) +
+  facet_grid(sex ~ genotype) +
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(y = "Genes detected (count > 0)",
+       title = "Gene detection rate by experimental group") +
+  theme_bw()
+```
+
+---
+
+## Read MultiQC alignment summary
+
+> **Note:** This section reads the MultiQC alignment TSV exported from
+> `results/multiqc/aligned/multiqc_data/multiqc_star.txt`. Run
+> `snakemake results/multiqc/aligned/multiqc_report.html` first.
+
+```{r multiqc, eval=file.exists("results/multiqc/aligned/multiqc_data/multiqc_star.txt")}
+mqc <- fread("results/multiqc/aligned/multiqc_data/multiqc_star.txt")
+# Standardise sample column name
+if ("Sample" %in% names(mqc)) setnames(mqc, "Sample", "sample_id")
+
+mqc <- mqc %>%
+  mutate(sample_id = str_remove(sample_id, "_Log\\.final$")) %>%
+  inner_join(meta[, c("sample_id", "batch", "treatment", "sex", "genotype")],
+             by = "sample_id")
+
+# Unique mapping rate
+p_map <- ggplot(mqc, aes(x = treatment,
+                          y = uniquely_mapped_percent,
+                          fill = batch)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 1, alpha = 0.6) +
+  geom_hline(yintercept = 80, linetype = "dashed", colour = "red") +
+  facet_wrap(~sex) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(y = "Uniquely mapped reads (%)",
+       title = "STAR unique alignment rate",
+       caption = "Red dashed line = 80% threshold") +
+  theme_bw()
+print(p_map)
+
+ggsave("results/analysis/01_sample_qc/alignment_rate.pdf", p_map,
+       width = 8, height = 5)
+```
+
+---
+
+## Outlier detection — hierarchical clustering of raw counts
+
+```{r outlier-hclust}
+# Use log2(CPM + 1) for distance-based clustering
+cpm_mat <- log2(sweep(counts, 2, colSums(counts), "/") * 1e6 + 1)
+sample_dist <- as.dist(1 - cor(cpm_mat, method = "spearman"))
+hc <- hclust(sample_dist, method = "average")
+
+# Colour bars
+ann_col <- meta %>%
+  column_to_rownames("sample_id") %>%
+  select(batch, treatment, region, sex, genotype)
+
+# Identify samples with correlation < 0.85 to all others (potential outliers)
+cor_mat <- cor(cpm_mat, method = "spearman")
+min_cor  <- apply(cor_mat, 1, function(x) min(x[x < 1]))
+outliers <- names(min_cor[min_cor < 0.85])
+
+if (length(outliers) > 0) {
+  cat("Potential outlier samples (min Spearman r < 0.85):\n")
+  print(outliers)
+} else {
+  cat("No outlier samples detected.\n")
+}
+
+pheatmap(cor_mat,
+         annotation_col = ann_col,
+         clustering_distance_rows = sample_dist,
+         clustering_distance_cols = sample_dist,
+         color = colorRampPalette(rev(brewer.pal(9, "RdYlBu")))(100),
+         breaks = seq(0.7, 1, length.out = 101),
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         main = "Sample-to-sample Spearman correlation",
+         filename = "results/analysis/01_sample_qc/sample_correlation_heatmap.pdf",
+         width = 10, height = 9)
+```
+
+---
+
+## Summary and exclusion list
+
+```{r summary}
+qc_summary <- meta %>%
+  mutate(
+    pass_depth    = total_counts >= depth_cutoff,
+    pass_outlier  = !sample_id %in% outliers
+  ) %>%
+  select(sample_id, batch, treatment, region, pmi, sex, genotype,
+         total_counts, genes_detected, pass_depth, pass_outlier)
+
+fail_samples <- qc_summary %>% filter(!pass_depth | !pass_outlier)
+
+cat(sprintf("\n%d / %d samples flagged for review:\n",
+            nrow(fail_samples), nrow(qc_summary)))
+print(fail_samples)
+
+write.csv(qc_summary,
+          "results/analysis/01_sample_qc/qc_summary.csv",
+          row.names = FALSE)
+
+# Save list of samples to EXCLUDE (set manually after review)
+# Adjust the filter below based on your assessment of flagged samples
+exclude_ids <- fail_samples$sample_id
+saveRDS(exclude_ids, "results/analysis/01_sample_qc/exclude_samples.rds")
+cat("\nExclude list saved. Review and edit as needed before proceeding.\n")
+```
+
+---
+
+## Session info
+```{r session}
+sessionInfo()
+```

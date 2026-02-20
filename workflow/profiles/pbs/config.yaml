@@ -1,0 +1,30 @@
+# Snakemake PBS/SGE cluster profile
+# Usage: snakemake --profile workflow/profiles/pbs --jobs 50 --use-conda
+
+cluster: >-
+  qsub
+  -N smk_{rule}
+  -l ncpus={threads}
+  -l mem={resources.mem_mb}mb
+  -l walltime={resources.walltime}
+  -q {resources.queue}
+  -o logs/cluster/
+  -e logs/cluster/
+  -V
+  -j oe
+
+cluster-status: "python workflow/profiles/pbs/pbs_status.py {jobid}"
+cluster-cancel: "qdel"
+cluster-cancel-nargs: 100
+
+jobs: 50
+latency-wait: 60
+use-conda: true
+rerun-incomplete: true
+keep-going: true
+printshellcmds: true
+
+default-resources:
+  - queue=normal
+  - mem_mb=8000
+  - walltime=02:00:00

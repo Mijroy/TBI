@@ -1,0 +1,320 @@
+---
+title: "TBI RNA-seq — 05 Pathway Enrichment"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 10, fig.height = 7
+)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(ReactomePA)
+  library(org.Mm.eg.db)
+  library(fgsea)
+  library(msigdbr)
+  library(AnnotationDbi)
+  library(patchwork)
+  library(RColorBrewer)
+})
+dir.create("results/analysis/05_pathway", recursive = TRUE, showWarnings = FALSE)
+set.seed(42)
+
+FDR     <- 0.05
+LFC     <- 1.0
+P_PATH  <- 0.05   # pathway FDR threshold
+```
+
+## Scientific questions
+
+1. What biological pathways (GO/KEGG/Reactome) are enriched in TBI vs SHAM DEGs?
+2. Does EGT treatment target specific signalling pathways (neuroinflammation, apoptosis, synaptic plasticity)?
+3. Are there sex-specific pathway responses to TBI?
+4. Do KO-specific TBI DEGs implicate the known function of the KO gene?
+5. What MSigDB Hallmarks are enriched across contrasts?
+
+---
+
+## Load DEG results
+
+```{r load}
+load_deg <- function(file) {
+  read.csv(file) %>%
+    filter(!is.na(padj) & !is.na(log2FoldChange))
+}
+
+deg_files <- list(
+  TBI_vs_SHAM  = "results/analysis/03_deseq2_main/TBI_vs_SHAM.csv",
+  EGT_vs_TBI   = "results/analysis/03_deseq2_main/EGT_vs_TBI.csv",
+  EGT_vs_SHAM  = "results/analysis/03_deseq2_main/EGT_vs_SHAM.csv",
+  Ips_vs_Con   = "results/analysis/03_deseq2_main/Ips_vs_Con.csv",
+  PMI_24h_vs_8h = "results/analysis/03_deseq2_main/PMI_24h_vs_8h.csv",
+  Sex_MvF      = "results/analysis/03_deseq2_main/Male_vs_Female.csv",
+  Genotype_KOvWT = "results/analysis/03_deseq2_main/KO_vs_WT.csv"
+)
+
+degs <- lapply(deg_files[file.exists(unlist(deg_files))], load_deg)
+cat("Loaded contrasts:", paste(names(degs), collapse = ", "), "\n")
+```
+
+---
+
+## Gene ID conversion (Ensembl → Entrez)
+
+```{r id-map}
+# Build a mapping table once and reuse
+all_genes <- unique(unlist(lapply(degs, `[[`, "gene_id")))
+# Strip version suffix if present (ENSMUSG00000000001.8 → ENSMUSG00000000001)
+all_genes_clean <- sub("\\.\\d+$", "", all_genes)
+
+id_map <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys    = all_genes_clean,
+  columns = c("ENTREZID", "SYMBOL", "GENENAME"),
+  keytype = "ENSEMBL"
+) %>%
+  filter(!is.na(ENTREZID)) %>%
+  distinct(ENSEMBL, .keep_all = TRUE)
+
+add_entrez <- function(df) {
+  df %>%
+    mutate(ENSEMBL = sub("\\.\\d+$", "", gene_id)) %>%
+    left_join(id_map, by = "ENSEMBL")
+}
+degs <- lapply(degs, add_entrez)
+```
+
+---
+
+## Helper functions
+
+```{r helpers}
+get_sig_entrez <- function(df, fdr = FDR, lfc = LFC) {
+  df %>%
+    filter(padj < fdr & abs(log2FoldChange) >= lfc & !is.na(ENTREZID)) %>%
+    pull(ENTREZID) %>% unique()
+}
+
+# Background = all tested genes with Entrez ID
+get_universe <- function(df) {
+  df %>% filter(!is.na(ENTREZID)) %>% pull(ENTREZID) %>% unique()
+}
+
+# Ranked list for GSEA (all genes, ranked by -log10(pvalue) * sign(LFC))
+get_ranked <- function(df) {
+  df %>%
+    filter(!is.na(ENTREZID) & !is.na(pvalue)) %>%
+    mutate(rank_stat = -log10(pvalue + 1e-300) * sign(log2FoldChange)) %>%
+    arrange(desc(rank_stat)) %>%
+    { setNames(.$rank_stat, .$ENTREZID) }
+}
+
+run_ora <- function(sig_entrez, universe, label, outdir) {
+  if (length(sig_entrez) < 5) {
+    message(label, ": too few significant genes for ORA")
+    return(NULL)
+  }
+  # GO Biological Process
+  ego <- enrichGO(gene         = sig_entrez,
+                  universe     = universe,
+                  OrgDb        = org.Mm.eg.db,
+                  ont          = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff = P_PATH,
+                  readable     = TRUE)
+  # KEGG
+  ekegg <- enrichKEGG(gene         = sig_entrez,
+                      universe     = universe,
+                      organism     = "mmu",
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = P_PATH)
+  # Reactome
+  ereact <- enrichPathway(gene         = sig_entrez,
+                           universe     = universe,
+                           organism     = "mouse",
+                           pAdjustMethod = "BH",
+                           pvalueCutoff = P_PATH,
+                           readable     = TRUE)
+
+  list(GO = ego, KEGG = ekegg, Reactome = ereact)
+}
+```
+
+---
+
+## ORA for each main contrast
+
+```{r ora-loop}
+ora_results <- list()
+
+for (contrast_name in names(degs)) {
+  df     <- degs[[contrast_name]]
+  sig_e  <- get_sig_entrez(df)
+  univ_e <- get_universe(df)
+
+  cat(sprintf("\n%s: %d significant genes\n", contrast_name, length(sig_e)))
+  res <- run_ora(sig_e, univ_e, contrast_name,
+                 outdir = "results/analysis/05_pathway")
+  if (is.null(res)) next
+  ora_results[[contrast_name]] <- res
+
+  # Save tables
+  for (db in names(res)) {
+    if (!is.null(res[[db]]) && nrow(as.data.frame(res[[db]])) > 0) {
+      write.csv(as.data.frame(res[[db]]),
+        file.path("results/analysis/05_pathway",
+                  sprintf("%s_%s_ORA.csv", contrast_name, db)),
+        row.names = FALSE)
+    }
+  }
+}
+```
+
+---
+
+## Dot plots — TBI vs SHAM top pathways
+
+```{r dotplot-tbi}
+if (!is.null(ora_results[["TBI_vs_SHAM"]])) {
+  p_go    <- dotplot(ora_results$TBI_vs_SHAM$GO,   showCategory = 20) +
+               ggtitle("GO:BP — TBI vs SHAM")
+  p_kegg  <- dotplot(ora_results$TBI_vs_SHAM$KEGG, showCategory = 20) +
+               ggtitle("KEGG — TBI vs SHAM")
+
+  p_go | p_kegg
+  ggsave("results/analysis/05_pathway/dotplot_TBI_vs_SHAM.pdf",
+         width = 16, height = 8)
+}
+```
+
+---
+
+## GSEA with MSigDB Hallmarks
+
+```{r gsea-hallmarks}
+hallmarks <- msigdbr(species = "Mus musculus", category = "H") %>%
+  select(gs_name, entrez_gene) %>%
+  distinct()
+hallmarks_list <- split(hallmarks$entrez_gene, hallmarks$gs_name)
+
+gsea_results <- list()
+
+for (contrast_name in names(degs)) {
+  ranked <- get_ranked(degs[[contrast_name]])
+  if (length(ranked) < 100) next
+
+  fgsea_res <- fgseaMultilevel(
+    pathways   = hallmarks_list,
+    stats      = ranked,
+    minSize    = 15,
+    maxSize    = 500,
+    nPermSimple = 10000
+  )
+  gsea_results[[contrast_name]] <- fgsea_res %>%
+    arrange(padj) %>%
+    filter(padj < P_PATH)
+
+  write.csv(gsea_results[[contrast_name]],
+    file.path("results/analysis/05_pathway",
+              sprintf("%s_Hallmarks_GSEA.csv", contrast_name)),
+    row.names = FALSE)
+}
+```
+
+### Hallmark GSEA heatmap across contrasts
+
+```{r gsea-heatmap}
+if (length(gsea_results) > 0) {
+  all_sig_paths <- unique(unlist(lapply(gsea_results, function(r) r$pathway)))
+
+  nes_mat <- sapply(names(gsea_results), function(cn) {
+    r <- gsea_results[[cn]]
+    sapply(all_sig_paths, function(p) {
+      idx <- match(p, r$pathway)
+      if (is.na(idx)) 0 else r$NES[idx]
+    })
+  })
+  rownames(nes_mat) <- all_sig_paths
+
+  # Keep only pathways significant in ≥1 contrast
+  keep_rows <- rowSums(nes_mat != 0) >= 1
+  nes_mat   <- nes_mat[keep_rows, , drop = FALSE]
+
+  if (nrow(nes_mat) > 1) {
+    pheatmap(nes_mat,
+             color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+             breaks = seq(-3, 3, length.out = 101),
+             cluster_cols = FALSE,
+             fontsize_row = 8,
+             main = "MSigDB Hallmarks NES across contrasts",
+             filename = "results/analysis/05_pathway/hallmarks_NES_heatmap.pdf",
+             width = 10, height = max(6, nrow(nes_mat) * 0.2))
+  }
+}
+```
+
+---
+
+## MSigDB C2 (curated gene sets) GSEA — TBI vs SHAM
+
+```{r gsea-c2}
+c2_sets <- msigdbr(species = "Mus musculus", category = "C2") %>%
+  select(gs_name, entrez_gene) %>% distinct()
+c2_list <- split(c2_sets$entrez_gene, c2_sets$gs_name)
+
+if ("TBI_vs_SHAM" %in% names(degs)) {
+  ranked_tbi <- get_ranked(degs$TBI_vs_SHAM)
+  fgsea_c2 <- fgseaMultilevel(
+    pathways    = c2_list,
+    stats       = ranked_tbi,
+    minSize     = 15,
+    maxSize     = 500,
+    nPermSimple = 10000
+  ) %>% arrange(padj)
+
+  top_c2 <- fgsea_c2 %>% filter(padj < P_PATH) %>% slice_min(padj, n = 30)
+  write.csv(fgsea_c2 %>% filter(padj < P_PATH),
+            "results/analysis/05_pathway/TBI_vs_SHAM_C2_GSEA.csv",
+            row.names = FALSE)
+
+  # GSEA enrichment plot for top pathway
+  if (nrow(top_c2) > 0) {
+    plotEnrichment(c2_list[[top_c2$pathway[1]]], ranked_tbi) +
+      ggtitle(paste("Top C2 pathway:", top_c2$pathway[1]))
+    ggsave("results/analysis/05_pathway/GSEA_top_C2_TBI.pdf", width = 7, height = 4)
+  }
+}
+```
+
+---
+
+## Enrichment map — TBI vs SHAM GO results
+
+```{r emapplot}
+if (!is.null(ora_results[["TBI_vs_SHAM"]]) &&
+    !is.null(ora_results$TBI_vs_SHAM$GO) &&
+    nrow(as.data.frame(ora_results$TBI_vs_SHAM$GO)) >= 5) {
+
+  ego_sim <- pairwise_termsim(ora_results$TBI_vs_SHAM$GO)
+  emapplot(ego_sim, showCategory = 30) +
+    ggtitle("GO:BP enrichment map — TBI vs SHAM")
+  ggsave("results/analysis/05_pathway/emapplot_TBI_vs_SHAM_GO.pdf",
+         width = 12, height = 10)
+}
+```
+
+---
+
+## Session info
+```{r session}
+sessionInfo()
+```
